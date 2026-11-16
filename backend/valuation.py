@@ -45,7 +45,7 @@ DIVERGE_GAP = 0.30         # PE/PB 分位背离阈值(百分点)
 DIVERGE_PE_MIN = 0.60      # PE 分位需高于此值才判定为"PE虚高"
 DIVERGE_W_SHIFT = 0.20     # 背离时 PE 权重下调幅度
 MIN_HISTORY_YEARS = 3      # 历史不足3年不输出分位数字
-DCA_STOP, DCA_SPAN = 0.80, 0.50   # 定投系数: (0.80 - 综合分位) / 0.50
+DCA_SPAN = 0.50            # 定投系数线性区间宽度；停投点 = 该类型止盈第1档分位（口径自洽）
 DCA_MAX = 1.5              # 定投系数上限
 SELL_HOLD_WEEKS = 4        # 综合分位连续处于高估区的周数阈值，达到则提示减仓
 SELL_LOOKBACK = 52         # 连续高估计数最多回看一年
@@ -57,6 +57,7 @@ SELL_TIERS = {
     "growth": (0.85, 0.90, 0.95),
 }
 SELL_REDUCE = {1: 0.25, 2: 0.50, 3: 1.00}
+DCA_RESUME = 0.40          # 清仓后综合分位回落至此以下恢复定投（= 合理偏低上沿）
 
 # 股债收益差(ERP) = 1/PE - 10年期国债收益率；仅对宽基中的价值/均衡型启用
 # 利率长期下行会抬升 ERP 中枢，故不单看分位，需与综合分位交叉确认才调定投系数
@@ -66,6 +67,11 @@ ERP_HIGH_PCT, ERP_LOW_PCT = 0.80, 0.20   # ERP 分位阈值
 ERP_ZONE_LOW, ERP_ZONE_HIGH = 0.40, 0.65  # 综合分位需同时满足的区间
 ERP_BOOST, ERP_CUT = 1.20, 0.80           # 定投系数调节倍数
 ERP_YEARS = 10                            # ERP 分位回看年数
+
+# 周期顶检测（pe_inflated 的镜像）：PB 分位远高于 PE 分位，且隐含 ROE 处于历史高位
+# → 盈利大概率在周期顶部，低 PE 是盈利高位的假象，同样下调 PE 权重（综合分位上调）
+CYCLE_PB_MIN = 0.60        # PB 分位需高于此值
+CYCLE_ROE_PCT = 0.90       # 隐含 ROE 处于近3年分位的高位阈值
 
 
 @dataclass
@@ -94,7 +100,8 @@ class ValuationResult:
     note: str = ""
     history: list = field(default_factory=list)  # 综合百分位历史(采样)
     pe_norm: Optional[float] = None  # 正常化PE(3年平滑盈利)
-    divergence: str = ""  # pe_inflated: 判定失真并调权; pe_watch: 背离但ROE未恶化
+    divergence: str = ""  # pe_inflated: 判定失真并调权; pe_watch: 背离但ROE未恶化;
+                          # cyclical_peak: 周期顶低PE陷阱，调权后综合分位上调
     roe: Optional[float] = None      # 隐含ROE = PB/PE
     roe_mean3: Optional[float] = None  # 近3年平均ROE
     roe_percentile: Optional[float] = None
@@ -156,11 +163,14 @@ def earnings_growth(e: pd.Series) -> tuple[Optional[float], Optional[float], Opt
     return g, g1, g3
 
 
-def dynamic_weights(g: Optional[float], base_w_pe: float) -> tuple[float, float]:
-    """类型基准权重 + g 边际微调"""
+def dynamic_weights(g: Optional[float], base_w_pe: float,
+                    full: bool = True) -> tuple[float, float]:
+    """类型基准权重 + g 边际微调；full=False 表示仅1年同比可用，调整幅度减半降噪"""
     if g is None:
         return base_w_pe, round(1 - base_w_pe, 3)
     adj = max(-G_CAP, min(G_CAP, g)) / G_CAP * G_ADJUST_MAX
+    if not full:
+        adj *= 0.5
     w_pe = max(W_PE_MIN, min(W_PE_MAX, base_w_pe + adj))
     return round(w_pe, 3), round(1 - w_pe, 3)
 
@@ -260,16 +270,19 @@ def compute(symbol: str, name: str, df: pd.DataFrame,
     base = BASE_W_PE.get(index_type, 0.50)
     type_label = INDEX_TYPE_LABEL.get(index_type, "均衡型")
     g, g1, g3 = earnings_growth(df["close"] / df["pe_ttm"])
-    w_pe, w_pb = dynamic_weights(g, base)
+    w_pe, w_pb = dynamic_weights(g, base, full=(g3 is not None))
     w_pe_g = w_pe  # g 微调后的权重（背离修正前），用于文案
     distorted = g is not None and g < 0
 
     composite = w_pe * pe_pct + w_pb * pb_pct
 
-    # 隐含 ROE = PB / PE，用于校验背离是"盈利暂时波动"还是"资产质量恶化"
+    # 隐含 ROE = PB / PE；取近4周均值平滑，避免单周财报噪音导致背离误判
     roe = implied_roe(df)
-    roe_now = float(roe.iloc[-1]) if pd.notna(roe.iloc[-1]) else None
-    roe_mean3 = float(roe.iloc[-3 * PTS_PER_YEAR:].mean())
+    roe_s = roe.rolling(4, min_periods=2).mean()
+    roe_now = float(roe_s.iloc[-1]) if pd.notna(roe_s.iloc[-1]) else None
+    hist = roe.iloc[-(3 * PTS_PER_YEAR + 1):-1].dropna()  # 均值剔除当期，避免自引用
+    roe_mean3 = (float(hist.mean()) if len(hist) >= 20
+                 else float(roe.iloc[-3 * PTS_PER_YEAR:].mean()))
     roe_pct = _percentile_of(roe, roe_now) if roe_now is not None else float("nan")
 
     # PE/PB 分位背离检测：PE 高而 PB 低，多半是盈利下滑把 PE 抬起来了
@@ -284,6 +297,13 @@ def compute(symbol: str, name: str, df: pd.DataFrame,
             w_pe = max(W_PE_MIN, round(w_pe - DIVERGE_W_SHIFT, 3))
             w_pb = round(1 - w_pe, 3)
             composite = w_pe * pe_pct + w_pb * pb_pct
+    elif (pb_pct - pe_pct >= DIVERGE_GAP and pb_pct >= CYCLE_PB_MIN
+            and roe_now is not None and pd.notna(roe_pct) and roe_pct >= CYCLE_ROE_PCT):
+        # 周期顶镜像：盈利处于高位使 PE 显得便宜，实为周期顶陷阱，PE 权重下调→分位上调
+        divergence = "cyclical_peak"
+        w_pe = max(W_PE_MIN, round(w_pe - DIVERGE_W_SHIFT, 3))
+        w_pb = round(1 - w_pe, 3)
+        composite = w_pe * pe_pct + w_pb * pb_pct
 
     note = ""
     span_years = (pd.to_datetime(df["date"].iloc[-1]) - pd.to_datetime(df["date"].iloc[0])).days / 365
@@ -313,6 +333,10 @@ def compute(symbol: str, name: str, df: pd.DataFrame,
     elif divergence == "pe_watch":
         note += (f"PE 分位 {pe_pct:.0%} 高于 PB 分位 {pb_pct:.0%}，但隐含 ROE {roe_now:.1%} 不低于近3年均值 "
                  f"{roe_mean3:.1%}，倾向盈利阶段性波动，未下调 PE 权重。")
+    elif divergence == "cyclical_peak":
+        note += (f"PB 分位 {pb_pct:.0%} 远高于 PE 分位 {pe_pct:.0%}，且隐含 ROE {roe_now:.1%} "
+                 f"处于近3年 {roe_pct:.0%} 分位，盈利处于周期顶部或景气高点：低 PE 可能是盈利高位的假象，"
+                 f"已将 PE 权重由 {base_w:.0%} 下调至 {w_pe:.0%}，综合分位相应上调，谨防盈利均值回归。")
 
     # 综合百分位历史（用于走势图）：用当期权重近似全历史
     history = _composite_history(df, w_pe, w_pb, pe_norm)
@@ -324,12 +348,13 @@ def compute(symbol: str, name: str, df: pd.DataFrame,
 
     # 股债收益差：仅价值/均衡型宽基，且只在"估值便宜 + 股债性价比高"同时成立时加码
     erp, erp_pct, erp_boost = erp_metrics(df, y10, cat, index_type, composite, data_ok)
-    dca = round(min(DCA_MAX, max(0.0, (DCA_STOP - composite) / DCA_SPAN)), 2) if data_ok else None
+    # 定投系数：停投点与该类型止盈第1档对齐（价值/均衡 65%，成长 85%），口径自洽
+    sell_t1 = SELL_TIERS.get(index_type, SELL_TIERS["balanced"])[0]
+    dca = round(min(DCA_MAX, max(0.0, (sell_t1 - composite) / DCA_SPAN)), 2) if data_ok else None
     if dca is not None and erp_boost:
         dca = round(min(DCA_MAX, max(0.0, dca * erp_boost)), 2)
 
     # 止盈侧：连续 N 周处于高估区才提示减仓，过滤刚触线又回落的假信号
-    sell_t1 = SELL_TIERS.get(index_type, SELL_TIERS["balanced"])[0]
     streak = high_streak(df, w_pe, w_pb, threshold=sell_t1)
     out_high_weeks = streak if data_ok else 0
     tier, reduce_pct = sell_plan(composite, streak, index_type) if data_ok else (0, 0.0)
@@ -339,7 +364,8 @@ def compute(symbol: str, name: str, df: pd.DataFrame,
                  f"触发第 {tier} 档止盈：建议累计减仓 {reduce_pct:.0%}，"
                  f"暂停定投，分2~3批执行而非一次性卖出。")
         if tier == 3:
-            note += "已进入极端高估区，清仓后仅保留观察仓，等待分位回落再重新定投入场。"
+            note += (f"已进入极端高估区，清仓后仅保留观察仓，"
+                     f"待综合分位回落至 {DCA_RESUME:.0%} 以下（合理偏低区）再恢复定投入场。")
 
     if erp_boost and erp_boost > 1:
         note += (f"股债收益差 {erp:.2f}%（近十年 {erp_pct:.0%} 分位），且综合分位仅 {composite:.0%}，"

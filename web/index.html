@@ -195,6 +195,7 @@ function renderGrid(list) {
       ${d.distorted ? '<div class="warn">⚠ 盈利走弱致 PE 被动抬高，已边际下调 PE 权重</div>' : ""}
       ${d.divergence === "pe_inflated" ? `<div class="warn">⚠ PE 分位 ${pct(d.pe_percentile)} 远高于 PB 分位 ${pct(d.pb_percentile)}，ROE 低于近3年均值，判定 PE 虚高并下调权重</div>` : ""}
       ${d.divergence === "pe_watch" ? `<div class="warn info">ℹ PE 分位 ${pct(d.pe_percentile)} 高于 PB 分位 ${pct(d.pb_percentile)}，但 ROE 未恶化，判定为盈利波动，未调权</div>` : ""}
+      ${d.divergence === "cyclical_peak" ? `<div class="warn">⚠ PB 分位 ${pct(d.pb_percentile)} 远高于 PE 分位 ${pct(d.pe_percentile)}，且 ROE 处于近3年 ${pct(d.roe_percentile)} 分位，盈利处于周期顶部或景气高点，低 PE 可能是假象，已下调 PE 权重</div>` : ""}
     `;
     grid.appendChild(card);
   });
@@ -232,9 +233,10 @@ function placeDetail() {
     <div class="detail">
       <h2>${d.name} <span style="color:${c}">${d.composite == null ? "数据积累中" : pct(d.composite)}</span> <span class="zone" style="background:${c}">${d.zone}</span></h2>
       <div class="sub">${d.category_label} · ${d.type_label} · 近${d.history_years}年综合估值百分位走势（PE ${pct(d.w_pe)} / PB ${pct(d.w_pb)} 加权）· ${d.date}</div>
-      <div class="sub">定投系数 ×${d.dca == null ? "--" : d.dca.toFixed(2)}（基准金额的倍数，80% 分位停投，5% 分位封顶 1.5 倍）${d.erp_boost ? ` · 含股债性价比${d.erp_boost > 1 ? "上调" : "下调"} 20%` : ""}</div>
+      <div class="sub">定投系数 ×${d.dca == null ? "--" : d.dca.toFixed(2)}（基准金额的倍数，≥${st[0]}% 停投，分位越低投得越多，上限 1.5 倍）${d.erp_boost ? ` · 含股债性价比${d.erp_boost > 1 ? "上调" : "下调"} 20%` : ""}</div>
       <div class="sub">分批止盈：≥${st[0]}% 且连续 4 周 → 减仓 25%；≥${st[1]}% → 累计减仓 50%；≥${st[2]}% → 清仓观察${d.type_label === "成长型" ? "（成长型档位上移，避免长期高估区间过早离场）" : ""}</div>
-      <div class="sub"${d.sell_signal ? ' style="color:var(--high);font-weight:600"' : ""}>连续处于高估区（≥${st[0]}%）${d.high_weeks == null ? 0 : (d.high_weeks >= 52 ? "52+" : d.high_weeks)} 周${d.sell_signal ? ` · 当前第 ${d.sell_tier} 档，建议累计减仓 ${Math.round((d.reduce_pct || 0) * 100)}%，暂停定投` : "（连续满 4 周触发第 1 档）"}</div>
+      <div class="sub"${d.sell_signal ? ' style="color:var(--high);font-weight:600"' : ""}>连续处于高估区（≥${st[0]}%）${d.high_weeks == null ? 0 : (d.high_weeks >= 52 ? "52+" : d.high_weeks)} 周${d.sell_signal ? ` · 当前第 ${d.sell_tier} 档，建议累计减仓 ${Math.round((d.reduce_pct || 0) * 100)}%，暂停定投${d.sell_tier === 3 ? "；清仓后待分位回落至 40% 以下恢复定投" : ""}` : "（连续满 4 周触发第 1 档）"}</div>
+      <div class="sub">分档阈值基于宽基样本外回测校准；行业与港股历史较短、样本有限，区间仅供参考</div>
       <div class="chart-box"><svg id="chart"></svg><div id="tip" class="tip"></div></div>
       <div class="legend">
         <span><i style="background:#3b6ef0"></i>综合百分位</span>
@@ -341,7 +343,8 @@ function drawChart(history) {
       `<line x1="${x}" x2="${x}" y1="${PT}" y2="${H - PB_}" stroke="#3b6ef0" stroke-dasharray="3 3" stroke-width="1"/>` +
       `<circle cx="${x}" cy="${y}" r="3.5" fill="#3b6ef0"/>`;
     cursor.style.display = "";
-    const dca = Math.min(1.5, Math.max(0, (0.80 - h.composite) / 0.50));
+    const t1 = detailCache && detailCache.type_label === "成长型" ? 0.85 : 0.65;
+    const dca = Math.min(1.5, Math.max(0, (t1 - h.composite) / 0.50));
     tip.innerHTML = `<div>${h.date}</div><div>综合 ${(h.composite * 100).toFixed(1)}%</div>` +
       (h.composite_norm == null ? "" : `<div>正常化 ${(h.composite_norm * 100).toFixed(1)}%</div>`) +
       `<div>定投 ×${dca.toFixed(2)}${dca === 0 ? "（停投）" : ""}</div>` +

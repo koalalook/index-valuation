@@ -64,19 +64,20 @@ def rolling_signals(df: pd.DataFrame, y10: np.ndarray, index_type: str, cat: str
         pe_pct = float((pe[: i + 1] <= pe[i]).mean())
         pb_pct = float((pb[: i + 1] <= pb[i]).mean())
 
-        g = None
+        g = g3 = None
         if i >= v.PTS_PER_YEAR and e[i - v.PTS_PER_YEAR] > 0:
             g1 = e[i] / e[i - v.PTS_PER_YEAR] - 1
             g3 = None
             if i >= 3 * v.PTS_PER_YEAR and e[i - 3 * v.PTS_PER_YEAR] > 0:
                 g3 = (e[i] / e[i - 3 * v.PTS_PER_YEAR]) ** (1 / 3) - 1
             g = g1 if g3 is None else v.SMOOTH_W1 * g1 + v.SMOOTH_W3 * g3
-        w_pe, w_pb = v.dynamic_weights(g, base)
+        w_pe, w_pb = v.dynamic_weights(g, base, full=(g3 is not None))
         c = w_pe * pe_pct + w_pb * pb_pct
 
         if pe_pct - pb_pct >= v.DIVERGE_GAP and pe_pct >= v.DIVERGE_PE_MIN:
+            m_now = float(np.nanmean(roe[max(0, i - 3): i + 1]))          # 近4周均值
             m3 = float(np.nanmean(roe[max(0, i - 3 * v.PTS_PER_YEAR + 1): i + 1]))
-            if not (roe[i] >= m3):
+            if not (m_now >= m3):
                 w_pe = max(v.W_PE_MIN, round(w_pe - v.DIVERGE_W_SHIFT, 3))
                 w_pb = round(1 - w_pe, 3)
                 c = w_pe * pe_pct + w_pb * pb_pct
@@ -90,7 +91,7 @@ def rolling_signals(df: pd.DataFrame, y10: np.ndarray, index_type: str, cat: str
             elif ep <= v.ERP_LOW_PCT and c >= v.ERP_ZONE_HIGH:
                 boost = v.ERP_CUT
 
-        dca = min(v.DCA_MAX, max(0.0, (v.DCA_STOP - c) / v.DCA_SPAN) * boost)
+        dca = min(v.DCA_MAX, max(0.0, (sell_t1 - c) / v.DCA_SPAN) * boost)
         streak = streak + 1 if c >= sell_t1 else 0
         tier, _ = v.sell_plan(c, streak, index_type)
         comp[i], dcas[i], tiers[i] = c, dca, tier
